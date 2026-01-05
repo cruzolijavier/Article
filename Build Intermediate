@@ -1,0 +1,408 @@
+# FUNCTION THAT TRANSFORMS FOR ESC_1 - CSV VERSION
+
+import pandas as pd
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import os
+import re
+
+class SMILESToGJF:
+    def __init__(self):
+        self.target_coordinates = {
+            1: [3.1016250, 0.9202270, -0.9292380],      # atom :1 (will lose H)
+            2: [2.8530440, 2.1050140, -0.1670790],      # atom :2  
+            3: [3.1558240, 2.1899050, 1.2192530]       # atom :3
+        }
+        
+    def read_gjf_file(self, gjf_path):
+        """Reads an existing GJF file and extracts the coordinates"""
+        existing_atoms = []
+        existing_coords = []
+        
+        with open(gjf_path, 'r') as f:
+            lines = f.readlines()
+        
+        # Find the start of the coordinates section
+        coord_start = None
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*[0-9-]+\s+[0-9-]+\s*$', line.strip()):  # Line of charge and multiplicity
+                coord_start = i + 1
+                break
+        
+        if coord_start is None:
+            raise ValueError("Could not find coordinates section in GJF file.")
+        
+        # Read coordinates until an empty line is found
+        for i in range(coord_start, len(lines)):
+            line = lines[i].strip()
+            if not line: 
+                break
+            
+            parts = line.split()
+            if len(parts) >= 4:
+                atom = parts[0]
+                coords = [float(parts[1]), float(parts[2]), float(parts[3])]  
+                existing_atoms.append(atom)
+                existing_coords.append(coords)
+        
+        print(f"Read {len(existing_atoms)} coordinates from GJF file: {gjf_path}")
+        return existing_atoms, np.array(existing_coords)
+        
+    def read_smiles_csv(self, csv_path):
+        """Reads a CSV file containing SMILES and code names"""
+        df = pd.read_csv(csv_path)
+        
+        # Verify that required columns exist
+        required_columns = ['SMILES', 'code_name']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise ValueError(f"CSV must contain columns: {missing_columns}")
+        
+        # Verify and report null values
+        null_smiles = df['SMILES'].isnull().sum()
+        null_codes = df['code_name'].isnull().sum()
+        
+        if null_smiles > 0:
+            print(f"Warning: {null_smiles} rows with null SMILES will be omitted")
+        if null_codes > 0:
+            print(f"Warning: {null_codes} rows with null code_name will be omitted")
+        
+        # Filter rows with null values
+        df_clean = df.dropna(subset=['SMILES', 'code_name'])
+        
+        print(f"CSV read: {len(df)} total rows, {len(df_clean)} valid rows to process")
+        
+        return df_clean[['SMILES', 'code_name']]
+    
+    def generate_3d_from_mapped_smiles(self, smiles):
+        """Generates 3D coordinates from mapped SMILES"""
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+
+        # Save the mapping BEFORE adding hydrogens
+        original_atom_map = {}
+        for atom in mol.GetAtoms():
+            if atom.GetAtomMapNum() > 0:
+                original_atom_map[atom.GetAtomMapNum()] = atom.GetIdx()
+        
+        # Add hydrogens normally
+        mol = Chem.AddHs(mol)
+        
+        # Generate 3D coordinates
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=1000)
+        
+        # Extract coordinates and atoms
+        conf = mol.GetConformer()
+        coordinates = []
+        atoms = []
+        atom_map_to_idx = {}
+        
+        for atom in mol.GetAtoms():
+            pos = conf.GetAtomPosition(atom.GetIdx())
+            coordinates.append([pos.x, pos.y, pos.z])
+            atoms.append(atom.GetSymbol())
+            
+            # Save mapping if exists (only for original atoms)
+            if atom.GetAtomMapNum() > 0:
+                atom_map_to_idx[atom.GetAtomMapNum()] = atom.GetIdx()
+        
+        return atoms, np.array(coordinates), atom_map_to_idx, mol
+    
+    def remove_hydrogen_from_carbon(self, atoms, coordinates, atom_map_to_idx, mol):
+        """Removes a hydrogen atom directly bonded to the carbon atom mapped as :1"""
+        if 1 not in atom_map_to_idx:
+            print("Atom mapped as :1 not found, skipping hydrogen removal")
+            return atoms, coordinates, atom_map_to_idx
+        
+        carbon_idx = atom_map_to_idx[1]
+        
+        # Verify that atom :1 is carbon (IN THEORY IT SHOULD BE)
+        if atoms[carbon_idx] != 'C':
+            print(f"Warning: Atom :1 is not carbon, it is {atoms[carbon_idx]}")
+            return atoms, coordinates, atom_map_to_idx
+        
+        print(f"Carbon atom :1 found at index {carbon_idx}")
+        
+        # Get the carbon atom object
+        carbon_atom = mol.GetAtomWithIdx(carbon_idx)
+        
+        # Verify that the atom has mapping :1
+        if carbon_atom.GetAtomMapNum() != 1:
+            print(f"Error: The atom at index {carbon_idx} does not have mapping :1, it has mapping :{carbon_atom.GetAtomMapNum()}")
+            return atoms, coordinates, atom_map_to_idx
+        
+        # Find hydrogen atoms DIRECTLY connected to carbon :1
+        hydrogen_neighbors = []
+        for neighbor in carbon_atom.GetNeighbors():
+            if neighbor.GetSymbol() == 'H':
+                hydrogen_neighbors.append(neighbor.GetIdx())
+                print(f"Hydrogen found at index {neighbor.GetIdx()} connected to carbon :1")
+        
+        if hydrogen_neighbors:
+            # Take the first hydrogen connected to carbon :1 (ONLY ONE EXISTS BUT NOT CERTAIN)
+            h_to_remove = hydrogen_neighbors[0]
+            
+            print(f"Removing hydrogen at index {h_to_remove} connected to carbon :1 (index {carbon_idx})")
+
+            # Create new lists without the removed hydrogen
+            new_atoms = [atom for i, atom in enumerate(atoms) if i != h_to_remove]
+            new_coordinates = np.array([coord for i, coord in enumerate(coordinates) if i != h_to_remove])
+            
+            # Update mapping indices
+            new_atom_map_to_idx = {}
+            for map_num, old_idx in atom_map_to_idx.items():
+                if old_idx < h_to_remove:
+                    new_atom_map_to_idx[map_num] = old_idx
+                elif old_idx > h_to_remove:
+                    new_atom_map_to_idx[map_num] = old_idx - 1
+                # If old_idx == h_to_remove, that atom no longer exists, don't include it
+            
+            print(f"Hydrogen removed successfully from carbon :1")
+            print(f"Hydrogens remaining connected to carbon :1: {len(hydrogen_neighbors) - 1}")
+            return new_atoms, new_coordinates, new_atom_map_to_idx
+        else:
+            print("No hydrogen atoms directly connected to carbon :1 found, skipping removal")
+            return atoms, coordinates, atom_map_to_idx
+    
+    def align_to_target_coordinates_prioritize_atom1(self, coordinates, atom_map_to_idx):
+        """Aligns the molecule giving MAXIMUM PRIORITY to the position of atom :1"""
+        # Extract current coordinates of mapped atoms
+        current_coords = []
+        target_coords = []
+        
+        for map_num in [1, 2, 3]:
+            if map_num in atom_map_to_idx:
+                current_idx = atom_map_to_idx[map_num]
+                current_coords.append(coordinates[current_idx])
+                target_coords.append(self.target_coordinates[map_num])
+        
+        if len(current_coords) != 3:
+            raise ValueError("Not all three mapped atoms (:1, :2, :3) found for alignment.")
+        
+        current_coords = np.array(current_coords)
+        target_coords = np.array(target_coords)
+        
+        # MAXIMUM PRIORITY TO ATOM 1: Use its position as anchor point
+        atom1_current = current_coords[0]  # Atom :1
+        atom1_target = target_coords[0]    # Target position of atom :1
+        
+        # 1. Translate the entire molecule so that atom :1 is at its target position
+        translation = atom1_target - atom1_current
+        coordinates_translated = coordinates + translation
+        current_coords_translated = current_coords + translation
+        
+        # 2. Now calculate rotation using the other two atoms, keeping atom :1 fixed
+        # Center on atom :1 (which is already at its target position)
+        current_centered = current_coords_translated - atom1_target
+        target_centered = target_coords - atom1_target
+        
+        # Only use atoms 2 and 3 to calculate the rotation
+        if len(current_centered) >= 2:
+            current_rot = current_centered[1:]  # Atoms :2 and :3
+            target_rot = target_centered[1:]    # Target positions of :2 and :3
+            
+            # Calculate rotation matrix using SVD (Kabsch algorithm)
+            H = current_rot.T @ target_rot  # Creates a 3x3 matrix relating current and target positions
+            U, S, Vt = np.linalg.svd(H)   # Decomposes H into 3 matrices, U and Vt have rotation directions and S the intensities (S not needed)
+            R = Vt.T @ U.T  # Combines U and Vt to get optimal rotation, R minimizes distances between new positions and requested ones
+            
+            # Ensure it's a rotation (not reflection)
+            if np.linalg.det(R) < 0:    # If determinant is <0 it means reflection, inverts a row of Vt to correct it
+                Vt[-1, :] *= -1
+                R = Vt.T @ U.T
+           
+            # Apply rotation centered on atom :1
+            coords_centered = coordinates_translated - atom1_target
+            rotated_coords = (R @ coords_centered.T).T
+            final_coords = rotated_coords + atom1_target
+            
+            # Verify that atom :1 remains at its exact position
+            atom1_final = final_coords[atom_map_to_idx[1]]
+            error = np.linalg.norm(atom1_final - atom1_target)
+            print(f"Position error of atom :1: {error:.6f} Å")
+            
+            return final_coords
+        else:
+            return coordinates_translated
+    
+    def create_combined_gjf(self, existing_atoms, existing_coords, new_atoms, new_coords, output_path, title="Combined molecules"):
+        """Creates a GJF file combining existing and new molecules"""
+        # Combine atoms and coordinates
+        all_atoms = existing_atoms + new_atoms
+        all_coords = np.vstack([existing_coords, new_coords])
+        
+        with open(output_path, 'w') as f:
+            # Standard header for optimization calculation
+            f.write("%nprocshared=32\n")
+            f.write("%mem=64GB\n")  
+            f.write("# opt=(calcfc,maxstep=5) freq wb97xd/6-31g* scrf=(smd,solvent=nitromethane)\n")
+            f.write("\n")
+            f.write(f"{title}\n")
+            f.write("\n")
+            f.write("0 1\n")  # Charge and multiplicity
+            
+            # Coordinates
+            for atom, coord in zip(all_atoms, all_coords):
+                f.write(f"{atom:2s} {coord[0]:12.6f} {coord[1]:12.6f} {coord[2]:12.6f}\n")
+            
+            f.write("\n")
+            f.write("\n")
+        
+        print(f"Combined GJF file created: {output_path}")
+        print(f"Total atoms: {len(all_atoms)} (existing: {len(existing_atoms)}, new: {len(new_atoms)})")
+    
+    def create_gjf(self, atoms, coordinates, output_path, title="Generated from mapped SMILES"):
+        """Creates a GJF file for a single molecule"""
+        with open(output_path, 'w') as f:
+            f.write("%nprocshared=32\n")
+            f.write("%mem=64GB\n")  
+            f.write("# opt=(calcfc,maxstep=5) freq wb97xd/6-31g* scrf=(smd,solvent=nitromethane)\n")
+            f.write("\n")
+            f.write(f"{title}\n")
+            f.write("\n")
+            f.write("0 1\n")
+            
+            for atom, coord in zip(atoms, coordinates):
+                f.write(f"{atom:2s} {coord[0]:12.6f} {coord[1]:12.6f} {coord[2]:12.6f}\n")
+            
+            f.write("\n")
+            f.write("\n")
+        
+        print(f"GJF file created: {output_path}")
+        print(f"Total atoms: {len(atoms)}")
+    
+    def process_smiles(self, smiles, output_path, title="Generated from mapped SMILES"):
+        """Processes an individual SMILES and generates a GJF file"""
+        try:
+            # Generate 3D coordinates from mapped SMILES
+            atoms, coordinates, atom_map_to_idx, mol = self.generate_3d_from_mapped_smiles(smiles)
+            
+            # Remove hydrogen ONLY from carbon :1 if it exists
+            if 1 in atom_map_to_idx:
+                atoms, coordinates, atom_map_to_idx = self.remove_hydrogen_from_carbon(
+                    atoms, coordinates, atom_map_to_idx, mol)
+            
+            # Align with priority to atom :1
+            aligned_coords = self.align_to_target_coordinates_prioritize_atom1(coordinates, atom_map_to_idx)
+            
+            # Create GJF file
+            self.create_gjf(atoms, aligned_coords, output_path, title)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error processing {smiles}: {e}")
+            return False
+    
+    def process_smiles_with_existing_gjf(self, smiles, existing_gjf_path, output_path):
+        """Processes a SMILES and combines it with an existing GJF file"""
+        try:
+            # Read existing GJF file
+            existing_atoms, existing_coords = self.read_gjf_file(existing_gjf_path)
+            
+            # Process new SMILES
+            atoms, coordinates, atom_map_to_idx, mol = self.generate_3d_from_mapped_smiles(smiles)
+            
+            # Remove hydrogen ONLY from carbon :1
+            if 1 in atom_map_to_idx:
+                atoms, coordinates, atom_map_to_idx = self.remove_hydrogen_from_carbon(
+                    atoms, coordinates, atom_map_to_idx, mol)
+            
+            # Align with priority to atom :1
+            aligned_coords = self.align_to_target_coordinates_prioritize_atom1(coordinates, atom_map_to_idx)
+            
+            # Create combined GJF
+            self.create_combined_gjf(existing_atoms, existing_coords, atoms, aligned_coords, 
+                                   output_path, f"Combined: existing + {smiles}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error processing {smiles} with existing GJF: {e}")
+            return False
+    
+    def process_csv(self, csv_path, output_dir="gjf_outputs", existing_gjf_path=None):
+        """
+        Processes a complete CSV generating individual GJF files
+        
+        Args:
+            csv_path: Path to CSV file with SMILES and code_name columns
+            output_dir: Directory where generated GJF files will be saved
+            existing_gjf_path: If provided, combines each SMILES with this GJF file
+        """
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Directory created: {output_dir}")
+        
+        # Read CSV
+        df = self.read_smiles_csv(csv_path)
+        
+        # Counters for statistics
+        total_molecules = len(df)
+        processed_successfully = 0
+        failed_molecules = []
+        
+        print(f"\nSTARTING PROCESSING OF {total_molecules} MOLECULES\n")
+        
+        # Process each row of the CSV
+        for index, row in df.iterrows():
+            smiles = row['SMILES']
+            code_name = row['code_name']
+            
+            # Clean code_name to use as filename
+            safe_code_name = re.sub(r'[^\w\-_.]', '_', str(code_name))
+            
+            # Generate output filename
+            output_filename = f"{safe_code_name}_ESC_1.com"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            print(f"[{index + 1}/{total_molecules}] Processing: {code_name} ({smiles})")
+            
+            # Process depending on whether there is an existing GJF file or not
+            if existing_gjf_path and os.path.exists(existing_gjf_path):
+                success = self.process_smiles_with_existing_gjf(smiles, existing_gjf_path, output_path)
+            else:
+                success = self.process_smiles(smiles, output_path, code_name)
+            
+            if success:
+                processed_successfully += 1
+                print(f"✓ Success: {output_filename}")
+            else:
+                failed_molecules.append((code_name, smiles))
+                print(f"✗ Failed: {code_name}")
+            
+            print("-" * 50)
+        
+        # Final summary
+        print(f"\nPROCESSING SUMMARY")
+        print(f"Total molecules: {total_molecules}")
+        print(f"Successfully processed: {processed_successfully}")
+        print(f"Failed: {len(failed_molecules)}")
+        print(f"Success rate: {(processed_successfully/total_molecules)*100:.1f}%")
+        
+        if failed_molecules:
+            print(f"\nMolecules that failed:")
+            for code_name, smiles in failed_molecules:
+                print(f"  - {code_name}: {smiles}")
+        
+        print(f"\nGJF files generated in: {os.path.abspath(output_dir)}")
+        
+        return processed_successfully, failed_molecules
+
+# Usage example
+if __name__ == "__main__":
+    generator = SMILESToGJF()
+    
+    # PROCESS COMPLETE CSV
+    csv_file = "naftalenos_batch1_mapped.csv"  # CSV with SMILES and code_name columns
+    
+    # Option 1: Generate individual GJF files
+    # generator.process_csv(csv_file, output_dir="gjf_outputs")
+    
+    # Option 2: Generate combined GJF files with an existing file
+    generator.process_csv(csv_file, output_dir="ESC_1_todos", existing_gjf_path="ESC_1_reactiva.gjf")
